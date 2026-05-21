@@ -87,6 +87,33 @@ export interface PlaybackHealthResult {
   score?: number;
   grade?: 'A' | 'B' | 'C' | 'D';
   debug?: Record<string, unknown>;
+
+  // NOTE: 新增真实吞吐量测速字段
+  firstByteMs?: number;
+  sampleBytes?: number;
+  sampleDurationMs?: number;
+  throughputKBps?: number;
+  throughputKbps?: number;
+  estimatedPlayable?: boolean;
+  requiredBandwidthKbps?: number;
+  selectedVariantBandwidthKbps?: number;
+
+  corsOk?: boolean;
+  runtimeTarget?: 'vercel' | 'docker' | 'node' | 'unknown';
+  smallAsset?: {
+    ok: boolean;
+    status?: number;
+    contentType?: string;
+    contentLength?: number;
+    acceptRanges?: string;
+    timeToFirstByteMs?: number;
+    firstChunkBytes?: number;
+    reason?: string;
+    corsOk?: boolean;
+    sampleBytes?: number;
+    sampleDurationMs?: number;
+    throughputKbps?: number;
+  };
 }
 
 export const DEFAULT_ANDROID_TV_UA =
@@ -166,35 +193,63 @@ export function getPlaylistBaseUrl(finalUrl: string): string {
 
 export function unwrapDecoProxyUrl(rawUrl: string): {
   url: string;
-  referer?: string;
+  originalUrl: string;
+  wasDecoProxy: boolean;
   wasProxy: boolean;
+  proxyRoute?: string;
   proxyPath?: string;
+  oldSig?: string;
+  referer?: string;
 } {
-  const sanitized = sanitizeEpisodeUrl(rawUrl);
-  try {
-    const base =
-      typeof window !== 'undefined' ? window.location.origin : 'http://local';
-    const parsed = new URL(sanitized, base);
-    const isDecoProxy =
-      parsed.pathname === '/api/proxy/m3u8' ||
-      parsed.pathname === '/api/proxy/m3u8-filter' ||
-      parsed.pathname === '/api/proxy/m3u8-asset' ||
-      parsed.pathname === '/api/proxy/segment' ||
-      parsed.pathname === '/api/proxy/key';
-    const upstream = parsed.searchParams.get('url');
-    if (isDecoProxy && upstream) {
-      return {
-        url: sanitizeEpisodeUrl(upstream),
-        referer: parsed.searchParams.get('referer') || undefined,
-        wasProxy: true,
-        proxyPath: parsed.pathname,
-      };
+  let currentUrl = sanitizeEpisodeUrl(rawUrl);
+  let wasDecoProxy = false;
+  let firstProxyRoute: string | undefined = undefined;
+  let firstOldSig: string | undefined = undefined;
+  let firstReferer: string | undefined = undefined;
+
+  const base =
+    typeof window !== 'undefined' ? window.location.origin : 'http://local';
+
+  // NOTE: 使用 while(true) 递归解包真正的原始上游 URL
+  while (true) {
+    try {
+      const parsed = new URL(currentUrl, base);
+      const isDecoProxy =
+        parsed.pathname === '/api/proxy/m3u8' ||
+        parsed.pathname === '/api/proxy/m3u8-filter' ||
+        parsed.pathname === '/api/proxy/m3u8-asset' ||
+        parsed.pathname === '/api/proxy/segment' ||
+        parsed.pathname === '/api/proxy/key';
+
+      if (isDecoProxy) {
+        const upstream = parsed.searchParams.get('url');
+        if (upstream) {
+          if (!wasDecoProxy) {
+            wasDecoProxy = true;
+            firstProxyRoute = parsed.pathname;
+            firstOldSig = parsed.searchParams.get('sig') || undefined;
+            firstReferer = parsed.searchParams.get('referer') || undefined;
+          }
+          currentUrl = sanitizeEpisodeUrl(upstream);
+          continue;
+        }
+      }
+    } catch {
+      // ignore parse failures and stop unwrapping
     }
-  } catch {
-    // Fall through to the sanitized input.
+    break;
   }
 
-  return { url: sanitized, wasProxy: false };
+  return {
+    url: currentUrl,
+    originalUrl: currentUrl,
+    wasDecoProxy,
+    wasProxy: wasDecoProxy,
+    proxyRoute: firstProxyRoute,
+    proxyPath: firstProxyRoute,
+    oldSig: firstOldSig,
+    referer: firstReferer,
+  };
 }
 
 export function hasSuspiciousUrlEncoding(rawUrl: string): string[] {
@@ -345,30 +400,76 @@ export function scorePlaybackHealth(
   health: Pick<
     PlaybackHealthResult,
     'manifest' | 'key' | 'firstSegment' | 'cors' | 'playable' | 'nestedProxy'
-  >,
+  > & {
+    throughputKbps?: number;
+    selectedVariantBandwidthKbps?: number;
+  },
 ): { score: number; grade: 'A' | 'B' | 'C' | 'D' } {
   let score = 0;
 
-  if (health.firstSegment?.ok) {
-    score += 40;
-    const ttfb = health.firstSegment.timeToFirstByteMs || 0;
+  // 1. m3u8 列表是否成功获取
+  const manifestOk = health.manifest?.ok;
+  if (manifestOk) score += 15;
+
+  // 2. 解密 Key 是否成功获取（如果存在）
+  const keyOk = !health.key?.present || health.key?.ok;
+  if (keyOk) score += 10;
+
+  // 3. 首片/首帧分片基础连通性检测
+  const segmentOk = health.firstSegment?.ok;
+  if (segmentOk) {
+    score += 30;
+    const ttfb = health.firstSegment?.timeToFirstByteMs || 0;
     if (ttfb > 0) {
-      if (ttfb <= 800) score += 30;
-      else if (ttfb <= 2000) score += 24;
-      else if (ttfb <= 5000) score += 16;
-      else score += 8;
+      if (ttfb <= 800) score += 15;
+      else if (ttfb <= 2000) score += 10;
+      else if (ttfb <= 5000) score += 5;
+      else score += 2;
     } else {
-      score += 12;
+      score += 5;
     }
   }
 
-  if (health.manifest?.ok) score += 15;
-  if (!health.key?.present || health.key.ok) score += 10;
+  // 4. 吞吐量吞吐速度加分
+  const throughput = health.throughputKbps || 0;
+  const reqBandwidth = health.selectedVariantBandwidthKbps
+    ? health.selectedVariantBandwidthKbps * 1.2
+    : 1000; // 默认标清播放起步带宽 1000 Kbps (125 KB/s)
+
+  let throughputOk = false;
+  if (segmentOk && throughput > 0) {
+    if (throughput >= reqBandwidth) {
+      score += 30;
+      throughputOk = true;
+    } else if (throughput >= reqBandwidth * 0.7) {
+      score += 20;
+    } else if (throughput >= reqBandwidth * 0.4) {
+      score += 10;
+    } else {
+      score += 2;
+    }
+  }
+
   if (health.cors?.manifestReadable) score += 5;
-  if (health.playable && score < 65) score = 65;
   if (health.nestedProxy) score -= 8;
   score = Math.max(0, Math.min(100, Math.round(score)));
 
-  const grade = score >= 85 ? 'A' : score >= 70 ? 'B' : score >= 45 ? 'C' : 'D';
+  // 判定是否可播放：基础连通性全部通过
+  const playable = Boolean(health.playable && manifestOk && segmentOk && keyOk);
+
+  let grade: 'A' | 'B' | 'C' | 'D' = 'D';
+  if (!playable) {
+    grade = 'D';
+  } else {
+    // NOTE: 只有在基础资源均就绪，且吞吐量满足所选清晰度带宽需求时，才允许评定为 A 级
+    if (manifestOk && keyOk && segmentOk && throughputOk && score >= 80) {
+      grade = 'A';
+    } else if (score >= 60) {
+      grade = 'B';
+    } else {
+      grade = 'C';
+    }
+  }
+
   return { score, grade };
 }

@@ -152,6 +152,12 @@ export async function resolvePlayableUrl(
       requestedStrategy,
       sourceName: input.sourceName,
       unwrappedProxyPath: unwrapped.proxyPath,
+      // NOTE: 保留诊断面板所需要的解包前后全套 URL 与签名信息
+      originalEpisodeUrl: input.episodeUrl,
+      unwrappedUrl: originalUrl,
+      wasDecoProxy: unwrapped.wasDecoProxy,
+      proxyRouteBefore: unwrapped.proxyRoute,
+      finalResolvedUrl: finalUrl,
     },
   };
 }

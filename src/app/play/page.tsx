@@ -492,6 +492,39 @@ function saveDanmukuSettings(settings: Partial<DanmukuSettings>) {
   }
 }
 
+/**
+ * 针对各类播放异常、超时与防盗链拦截等，给出人性的 UI 提示原因
+ * @param reason 原始异常标志
+ * @param health 播放链路测速与健康数据
+ * @returns 友好原因说明
+ */
+function getFriendlyFailureReason(
+  reason: string,
+  health: PlaybackHealthResult | null,
+): string {
+  const norm = (reason || '').toLowerCase();
+  if (
+    norm.includes('403') ||
+    norm.includes('forbidden') ||
+    norm.includes('http-403')
+  ) {
+    return '源站拒绝访问(403)，自动换源';
+  }
+  if (health && health.corsOk === false) {
+    return '视频首片跨域拒绝，自动尝试代理安全链路';
+  }
+  if (
+    norm.includes('loading-first-segment-timeout') ||
+    norm.includes('first-segment-timeout')
+  ) {
+    return '首片加载超时，正在自动切换备用链路';
+  }
+  if (norm.includes('buffering-timeout') || norm.includes('stalled')) {
+    return '视频加载缓慢/卡顿，正在自动尝试优化画质或换源';
+  }
+  return `播放异常(${reason})，正在为您寻找最优链路`;
+}
+
 function PlayPageClient() {
   const router = useRouter();
   const searchParams = useSearchParams();
@@ -668,6 +701,42 @@ function PlayPageClient() {
   // 视频播放地址
   const [videoUrl, setVideoUrl] = useState('');
   const [resolvedPlaybackUrl, setResolvedPlaybackUrl] = useState('');
+
+  // NOTE: 诊断与会话增强 Refs，用于多维度排查卡顿与播放异常问题
+  const playbackSessionIdRef = useRef<string>('');
+  const abortControllerRef = useRef<AbortController | null>(null);
+  const playbackEventsRef = useRef<
+    { time: string; event: string; detail?: any }[]
+  >([]);
+  const hlsErrorDetailsRef = useRef<
+    { time: string; type: string; detail: string; fatal: boolean }[]
+  >([]);
+  const playbackHealthRef = useRef<PlaybackHealthResult | null>(null);
+
+  // 视频原生事件解绑 Ref，防止重复绑定引发内存泄漏
+  const videoListenersCleanupRef = useRef<(() => void) | null>(null);
+
+  // 记录播放生命周期事件
+  const addPlaybackEvent = useCallback((event: string, detail?: any) => {
+    const time = new Date().toISOString();
+    playbackEventsRef.current = [
+      ...playbackEventsRef.current.slice(-19), // 最多保留 20 条，避免内存膨胀
+      { time, event, detail },
+    ];
+  }, []);
+
+  // 记录 Hls 发生的异常详情
+  const addHlsError = useCallback(
+    (type: string, detail: string, fatal: boolean) => {
+      const time = new Date().toISOString();
+      hlsErrorDetailsRef.current = [
+        ...hlsErrorDetailsRef.current.slice(-19),
+        { time, type, detail, fatal },
+      ];
+    },
+    [],
+  );
+
   const [playbackStrategy, setPlaybackStrategy] =
     useState<PlaybackStrategy>('direct');
   const [playbackStreamType, setPlaybackStreamType] =
@@ -688,6 +757,11 @@ function PlayPageClient() {
   const [playbackHealth, setPlaybackHealth] =
     useState<PlaybackHealthResult | null>(null);
   const [playbackErrorReason, setPlaybackErrorReason] = useState('');
+
+  // 保持健康状态与 Ref 同步，方便闭包环境读取
+  useEffect(() => {
+    playbackHealthRef.current = playbackHealth;
+  }, [playbackHealth]);
 
   useEffect(() => {
     playbackStrategyRef.current = playbackStrategy;
@@ -2066,6 +2140,18 @@ function PlayPageClient() {
   const cleanupPlayer = () => {
     cleanupMobileMouseSeekPatch();
 
+    // 取消尚未完成的解析请求
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+      abortControllerRef.current = null;
+    }
+
+    // 解绑视频的原生事件，防止内存泄漏
+    if (videoListenersCleanupRef.current) {
+      videoListenersCleanupRef.current();
+      videoListenersCleanupRef.current = null;
+    }
+
     // Clean up DecoDock features and theme before destroying the player
     countdownCleanupRef.current?.();
     countdownCleanupRef.current = null;
@@ -2648,12 +2734,25 @@ function PlayPageClient() {
     ) => {
       if (!videoUrl) return;
 
+      // 取消上一个进行中的解析请求
+      if (abortControllerRef.current) {
+        abortControllerRef.current.abort();
+      }
+      const abortController = new AbortController();
+      abortControllerRef.current = abortController;
+
       const requestRawUrl = videoUrl;
       setPlaybackStatus('resolving');
       setPlaybackErrorReason('');
       setResolvedPlaybackUrl('');
       setIsVideoLoading(true);
       setVideoLoadingStage('initing');
+
+      addPlaybackEvent('resolve:start', {
+        sessionId: playbackSessionIdRef.current,
+        strategy: preferredStrategy,
+        proxyMode,
+      });
 
       try {
         const response = await fetch('/api/playback/resolve', {
@@ -2669,6 +2768,7 @@ function PlayPageClient() {
             proxyMode,
             strategy: preferredStrategy,
           }),
+          signal: abortController.signal,
         });
 
         if (!response.ok) {
@@ -2682,6 +2782,13 @@ function PlayPageClient() {
           strategy: PlaybackStrategy;
           health?: PlaybackHealthResult;
         };
+
+        addPlaybackEvent('resolve:success', {
+          strategy: resolved.strategy,
+          type: resolved.type,
+          healthScore: resolved.health?.score,
+          throughputKbps: resolved.health?.smallAsset?.throughputKbps,
+        });
 
         setPlaybackStrategy(resolved.strategy);
         playbackStrategyRef.current = resolved.strategy;
@@ -2706,8 +2813,17 @@ function PlayPageClient() {
           );
         }
       } catch (error) {
+        if (error instanceof Error && error.name === 'AbortError') {
+          // 被主动取消的请求，不进行错误提示和重试
+          console.log('播放解析请求已被取消');
+          return;
+        }
+
         const reason =
           error instanceof Error ? error.message : 'playback-resolve-failed';
+
+        addPlaybackEvent('resolve:error', { reason });
+
         setPlaybackErrorReason(reason);
         setPlaybackStatus('failed');
         markSourcePlaybackFailure(
@@ -2753,11 +2869,13 @@ function PlayPageClient() {
 
         playbackAttemptsRef.current.sourceSwitches += 1;
         setPlaybackStatus('switching-source');
-        setPlaybackErrorReason(reason);
-        showToast(
-          `正在尝试备用播放源 ${playbackAttemptsRef.current.sourceSwitches}/${maxSwitch}`,
-          'info',
-        );
+
+        addPlaybackEvent('switching-source', {
+          fromSource: `${currentSourceRef.current}-${currentIdRef.current}`,
+          toSource: candidateKey,
+          reason,
+        });
+
         const currentPlayTime = artPlayerRef.current?.currentTime || 0;
         if (currentPlayTime > 1) {
           resumeTimeRef.current = currentPlayTime;
@@ -2772,15 +2890,19 @@ function PlayPageClient() {
 
       return false;
     },
-    [availableSources],
+    [availableSources, addPlaybackEvent],
   );
 
   const handlePlaybackFailure = useCallback(
     async (reason: string) => {
       const sourceKey = `${currentSourceRef.current}-${currentIdRef.current}`;
       markSourcePlaybackFailure(sourceKey, reason);
-      setPlaybackErrorReason(reason);
-      setPlaybackStatus('recovering');
+
+      const friendlyReason = getFriendlyFailureReason(
+        reason,
+        playbackHealthRef.current,
+      );
+      setPlaybackErrorReason(friendlyReason);
 
       const strategyOrder: PlaybackStrategy[] = [
         'direct',
@@ -2791,17 +2913,51 @@ function PlayPageClient() {
       const currentIndex = Math.max(0, strategyOrder.indexOf(currentStrategy));
       const maxSwitch = getMaxAutoSwitch();
 
-      if (
+      const runtimeTarget =
+        playbackHealthRef.current?.runtimeTarget || 'unknown';
+      const isVercel = runtimeTarget === 'vercel';
+
+      let willSwitchStrategy =
         playbackAttemptsRef.current.strategySwitches < maxSwitch &&
-        currentIndex < strategyOrder.length - 1
+        currentIndex < strategyOrder.length - 1;
+
+      // NOTE: Vercel Serverless 环境中转大文件容易超时和超流量，故禁用 asset-proxy 中转代理并给予 UI 提示
+      if (
+        willSwitchStrategy &&
+        strategyOrder[currentIndex + 1] === 'asset-proxy' &&
+        isVercel
       ) {
+        willSwitchStrategy = false;
+        showToast(
+          'Vercel 部署环境不支持分片中转，已跳过代理尝试，正在换源...',
+          'info',
+        );
+        addPlaybackEvent('skip-asset-proxy-due-to-vercel');
+      }
+
+      if (willSwitchStrategy) {
+        setPlaybackStatus('switching-strategy');
+      } else {
+        setPlaybackStatus('switching-source');
+      }
+
+      addPlaybackEvent('playback-failure', {
+        reason,
+        friendlyReason,
+        willSwitchStrategy,
+        currentStrategy,
+      });
+
+      // 在 UI 停留 1 秒展示具体的换源或降级原因，提升用户感知
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+
+      if (willSwitchStrategy) {
         const nextStrategy = strategyOrder[currentIndex + 1];
         playbackAttemptsRef.current.strategySwitches += 1;
         const currentPlayTime = artPlayerRef.current?.currentTime || 0;
         if (currentPlayTime > 1) {
           resumeTimeRef.current = currentPlayTime;
         }
-        setPlaybackStatus('switching-strategy');
         showToast(
           `正在尝试备用播放链路 ${playbackAttemptsRef.current.strategySwitches}/${maxSwitch}`,
           'info',
@@ -2817,23 +2973,43 @@ function PlayPageClient() {
         showToast('当前可用播放链路已尝试完毕，请手动换源', 'error');
       }
     },
-    [resolveCurrentPlayback, switchToNextPlayableSource],
+    [resolveCurrentPlayback, switchToNextPlayableSource, addPlaybackEvent],
   );
 
   const copyPlaybackDiagnostics = useCallback(async () => {
     const diagnostics = {
-      title: videoTitleRef.current,
-      source: currentSourceRef.current,
-      sourceName: detailRef.current?.source_name,
-      episodeIndex: currentEpisodeIndexRef.current,
-      strategy: playbackStrategyRef.current,
-      status: playbackStatus,
-      urlType: playbackStreamType,
-      reason: playbackErrorReason,
-      rawUrl: videoUrl,
-      resolvedUrl: resolvedPlaybackUrl,
-      attempts: playbackAttemptsRef.current,
-      health: playbackHealth,
+      session: {
+        sessionId: playbackSessionIdRef.current,
+        title: videoTitleRef.current,
+        source: currentSourceRef.current,
+        sourceName: detailRef.current?.source_name,
+        episodeIndex: currentEpisodeIndexRef.current,
+        currentTime: artPlayerRef.current?.currentTime || 0,
+        duration: artPlayerRef.current?.duration || 0,
+      },
+      deployment: {
+        runtimeTarget: playbackHealth?.runtimeTarget || 'unknown',
+        isVercel: playbackHealth?.runtimeTarget === 'vercel',
+        location: typeof window !== 'undefined' ? window.location.href : '',
+        userAgent: typeof navigator !== 'undefined' ? navigator.userAgent : '',
+      },
+      playback: {
+        strategy: playbackStrategyRef.current,
+        status: playbackStatus,
+        urlType: playbackStreamType,
+        reason: playbackErrorReason,
+        rawUrl: videoUrl,
+        resolvedUrl: resolvedPlaybackUrl,
+        attempts: playbackAttemptsRef.current,
+      },
+      throughput: {
+        score: playbackHealth?.score || 'N/A',
+        throughputKbps: playbackHealth?.smallAsset?.throughputKbps || 0,
+        timeToFirstByteMs: playbackHealth?.smallAsset?.timeToFirstByteMs || 0,
+        corsOk: playbackHealth?.corsOk,
+      },
+      events: playbackEventsRef.current,
+      hlsErrors: hlsErrorDetailsRef.current,
     };
 
     try {
@@ -2851,12 +3027,29 @@ function PlayPageClient() {
     videoUrl,
   ]);
 
+  const hasDowngradedFirstSegmentRef = useRef(false);
+  const hasDowngradedBufferingRef = useRef(false);
+  const [extraTimeoutTrigger, setExtraTimeoutTrigger] = useState(0);
+
   useEffect(() => {
     if (!videoUrl) {
       setResolvedPlaybackUrl('');
       setPlaybackStatus('idle');
       return;
     }
+
+    // 初始化新的播放会话 ID，清空旧的事件与错误历史
+    playbackSessionIdRef.current =
+      'sess_' + Math.random().toString(36).substring(2, 10) + '_' + Date.now();
+    playbackEventsRef.current = [];
+    hlsErrorDetailsRef.current = [];
+    hasDowngradedFirstSegmentRef.current = false;
+    hasDowngradedBufferingRef.current = false;
+
+    addPlaybackEvent('session:init', {
+      sessionId: playbackSessionIdRef.current,
+      videoUrl,
+    });
 
     playbackAttemptsRef.current = {
       strategySwitches: 0,
@@ -2873,23 +3066,79 @@ function PlayPageClient() {
       return;
     }
 
-    const timeoutMs =
-      playbackStatus === 'buffering'
-        ? 30000
-        : playbackStatus === 'loading-first-segment'
-          ? 20000
-          : playbackStatus === 'loading-manifest'
-            ? 10000
-            : 0;
+    let timeoutMs = 0;
+    if (playbackStatus === 'buffering') {
+      timeoutMs = 30000;
+    } else if (playbackStatus === 'loading-first-segment') {
+      // 若已降级过则进行 15 秒短超时，否则为 20 秒
+      timeoutMs = hasDowngradedFirstSegmentRef.current ? 15000 : 20000;
+    } else if (playbackStatus === 'loading-manifest') {
+      timeoutMs = 10000;
+    }
 
     if (!timeoutMs) return;
 
     const timer = window.setTimeout(() => {
+      const hls = artPlayerRef.current?.video?.hls;
+
+      // 首片加载超时：若存在多个清晰度且非最低清晰度，强制降级到最低清晰度 (索引 0) 并额外重试 15 秒
+      if (
+        playbackStatus === 'loading-first-segment' &&
+        !hasDowngradedFirstSegmentRef.current
+      ) {
+        if (
+          hls &&
+          hls.levels &&
+          hls.levels.length > 1 &&
+          hls.currentLevel > 0
+        ) {
+          console.log('首片加载超时，自动切换至最低画质重试');
+          hls.currentLevel = 0;
+          hasDowngradedFirstSegmentRef.current = true;
+          showToast('首片加载缓慢，已尝试切换至最低画质重试...', 'info');
+          addPlaybackEvent('first-segment-downgrade-retry', {
+            fromLevel: hls.currentLevel,
+            toLevel: 0,
+          });
+          setExtraTimeoutTrigger((prev) => prev + 1);
+          return;
+        }
+      }
+
+      // 播放卡顿缓冲超时：尝试降级至最低清晰度继续缓冲 30 秒，否则直接报错换源
+      if (
+        playbackStatus === 'buffering' &&
+        !hasDowngradedBufferingRef.current
+      ) {
+        if (
+          hls &&
+          hls.levels &&
+          hls.levels.length > 1 &&
+          hls.currentLevel > 0
+        ) {
+          console.log('播放卡顿超时，自动降级至最低画质');
+          hls.currentLevel = 0;
+          hasDowngradedBufferingRef.current = true;
+          showToast('缓冲超时，已自动降级画质以保障流畅播放...', 'info');
+          addPlaybackEvent('buffering-downgrade-retry', {
+            fromLevel: hls.currentLevel,
+            toLevel: 0,
+          });
+          setExtraTimeoutTrigger((prev) => prev + 1);
+          return;
+        }
+      }
+
       void handlePlaybackFailure(`${playbackStatus}-timeout`);
     }, timeoutMs);
 
     return () => window.clearTimeout(timer);
-  }, [handlePlaybackFailure, playbackStatus, resolvedPlaybackUrl]);
+  }, [
+    handlePlaybackFailure,
+    playbackStatus,
+    resolvedPlaybackUrl,
+    extraTimeoutTrigger,
+  ]);
 
   // ---------------------------------------------------------------------------
   // 键盘快捷键
@@ -3465,6 +3714,61 @@ function PlayPageClient() {
 
             ensureVideoSource(video, url);
 
+            // 绑定 video 元素的原生事件，配合 ref 记录播放细节，并精确识别真实首帧
+            const onLoadedMetadata = () => {
+              addPlaybackEvent('video-native:loadedmetadata');
+            };
+            const onLoadedData = () => {
+              addPlaybackEvent('video-native:loadeddata');
+              setPlaybackStatus('playing'); // 真实首帧成功出画面
+              setIsVideoLoading(false);
+            };
+            const onCanPlay = () => {
+              addPlaybackEvent('video-native:canplay');
+              setPlaybackStatus('playing'); // 真实首帧成功出画面
+              setIsVideoLoading(false);
+            };
+            const onPlaying = () => {
+              addPlaybackEvent('video-native:playing');
+            };
+            const onWaiting = () => {
+              addPlaybackEvent('video-native:waiting');
+              setPlaybackStatus('buffering');
+              setIsVideoLoading(true);
+            };
+            const onStalled = () => {
+              addPlaybackEvent('video-native:stalled');
+            };
+            const onVideoError = () => {
+              addPlaybackEvent('video-native:error', {
+                code: video.error?.code,
+                message: video.error?.message,
+              });
+            };
+
+            // 清理上一轮绑定的原生事件
+            if (videoListenersCleanupRef.current) {
+              videoListenersCleanupRef.current();
+            }
+
+            video.addEventListener('loadedmetadata', onLoadedMetadata);
+            video.addEventListener('loadeddata', onLoadedData);
+            video.addEventListener('canplay', onCanPlay);
+            video.addEventListener('playing', onPlaying);
+            video.addEventListener('waiting', onWaiting);
+            video.addEventListener('stalled', onStalled);
+            video.addEventListener('error', onVideoError);
+
+            videoListenersCleanupRef.current = () => {
+              video.removeEventListener('loadedmetadata', onLoadedMetadata);
+              video.removeEventListener('loadeddata', onLoadedData);
+              video.removeEventListener('canplay', onCanPlay);
+              video.removeEventListener('playing', onPlaying);
+              video.removeEventListener('waiting', onWaiting);
+              video.removeEventListener('stalled', onStalled);
+              video.removeEventListener('error', onVideoError);
+            };
+
             hls.on(
               Hls.Events.AUDIO_TRACKS_UPDATED,
               (
@@ -3549,28 +3853,52 @@ function PlayPageClient() {
             );
 
             hls.on(Hls.Events.MANIFEST_PARSED, () => {
+              const health = playbackHealthRef.current;
               const levels = hls.levels || [];
-              const preferred = levels
-                .map((level, index) => ({ level, index }))
-                .filter(({ level }) => {
-                  const height = level.height || 0;
-                  return height >= 720 && height <= 1080;
-                })
-                .sort((left, right) => {
-                  const heightDiff =
-                    (right.level.height || 0) - (left.level.height || 0);
-                  if (heightDiff !== 0) return heightDiff;
-                  return (right.level.bitrate || 0) - (left.level.bitrate || 0);
-                })[0];
 
-              if (preferred) {
-                hls.currentLevel = preferred.index;
+              addPlaybackEvent('hls:manifest-parsed', {
+                levelsCount: levels.length,
+                healthScore: health?.score,
+                throughputKbps: health?.smallAsset?.throughputKbps,
+              });
+
+              const isHealthy = health?.grade === 'A';
+
+              if (isHealthy) {
+                // A 级：链路状态优良，开启自动 ABR 首屏码率起播，让 hls.js 自行测量
+                hls.startLevel = -1;
+                console.log('播放链路健康评级为 A，允许自动 ABR 起播');
+              } else {
+                // B/C/D 级或未测量出：强制限制起播清晰度为 720p 或更低清晰度，防止卡死在 1080p
+                let targetIdx = 0;
+                const targetLevel = levels
+                  .map((lvl, idx) => ({ lvl, idx }))
+                  .filter(
+                    ({ lvl }) =>
+                      lvl.height && lvl.height >= 480 && lvl.height <= 720,
+                  )
+                  .sort((a, b) => (b.lvl.height || 0) - (a.lvl.height || 0))[0];
+
+                if (targetLevel) {
+                  targetIdx = targetLevel.idx;
+                }
+
+                hls.startLevel = targetIdx;
+                console.log(
+                  `播放链路不佳 (评级：${health?.score || '未知'})，限制首片起播清晰度 Level 索引为 ${targetIdx} (${levels[targetIdx]?.height || '未知'}p)`,
+                );
               }
               setPlaybackStatus('loading-first-segment');
             });
 
             hls.on(Hls.Events.ERROR, function (_event: any, data: any) {
               const reason = data?.details || data?.type || 'hls-error';
+              addHlsError(
+                data?.type || 'unknown',
+                data?.details || 'unknown',
+                !!data?.fatal,
+              );
+
               hlsErrorCountRef.current[reason] =
                 (hlsErrorCountRef.current[reason] || 0) + 1;
 
@@ -3630,23 +3958,7 @@ function PlayPageClient() {
             });
 
             hls.on(Hls.Events.ERROR, function (event: any, data: any) {
-              console.error('HLS Error:', event, data);
-              if (data.fatal && data.__legacyRecovery === true) {
-                switch (data.type) {
-                  case Hls.ErrorTypes.NETWORK_ERROR:
-                    console.log('网络错误，尝试恢复...');
-                    hls.startLoad();
-                    break;
-                  case Hls.ErrorTypes.MEDIA_ERROR:
-                    console.log('媒体错误，尝试恢复...');
-                    hls.recoverMediaError();
-                    break;
-                  default:
-                    console.log('无法恢复的错误');
-                    hls.destroy();
-                    break;
-                }
-              }
+              console.error('HLS Error Console:', event, data);
             });
           },
         },
